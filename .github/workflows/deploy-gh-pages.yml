@@ -1,5 +1,10 @@
 name: Build & Publish OTA Bundle
 
+# permission nécessaires pour que GITHUB_TOKEN puisse pousser sur gh-pages
+permissions:
+  contents: write
+  pages: write
+
 on:
   push:
     branches:
@@ -8,10 +13,18 @@ on:
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
+    permissions:
+      # redéclare localement si tu veux être explicite pour ce job
+      contents: write
+      pages: write
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # persist-credentials true (par défaut) permet l'utilisation de GITHUB_TOKEN pour push
+          persist-credentials: true
 
       - name: Setup Node 22
         uses: actions/setup-node@v4
