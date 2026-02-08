@@ -69,8 +69,8 @@ jobs:
       - name: Deploy to gh-pages using PAT
         uses: peaceiris/actions-gh-pages@v4
         with:
-          # Important: create secret GH_PAGES_TOKEN containing a PAT with repo write rights
-          github_token: ${{ secrets.GH_PAGES_TOKEN }}
+          # Important: create secret GITHUB_TOKEN containing a PAT with repo write rights
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./publish
           publish_branch: gh-pages
           commit_message: "ci: publish OTA bundle (app.zip + version.json) ✨"
