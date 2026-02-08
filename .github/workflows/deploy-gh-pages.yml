@@ -1,0 +1,46 @@
+name: Build & Publish OTA Bundle
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Create OTA package
+        run: |
+          rm -rf publish
+          mkdir publish
+          cp -r dist/* publish/
+
+          cd publish
+          zip -r ../app.zip . > /dev/null
+          cd ..
+
+          VERSION=$(node -p "require('./package.json').version")
+          echo "{\"version\":\"${VERSION}\"}" > publish/version.json
+
+          mv app.zip publish/app.zip
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./publish
