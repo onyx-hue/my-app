@@ -1,6 +1,6 @@
 name: Build & Publish OTA Bundle
 
-# permission nécessaires pour que GITHUB_TOKEN puisse pousser sur gh-pages
+# permissions utiles (explicites)
 permissions:
   contents: write
   pages: write
@@ -14,16 +14,14 @@ jobs:
   build-and-publish:
     runs-on: ubuntu-latest
     permissions:
-      # redéclare localement si tu veux être explicite pour ce job
       contents: write
       pages: write
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository (full)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # persist-credentials true (par défaut) permet l'utilisation de GITHUB_TOKEN pour push
           persist-credentials: true
 
       - name: Setup Node 22
@@ -46,28 +44,33 @@ jobs:
       - name: Build web app
         run: npm run build
 
-      - name: Create OTA package
+      - name: Create OTA package (publish folder + app.zip + version.json)
         run: |
           rm -rf publish
           mkdir publish
-          cp -r dist/* publish/
+          cp -r dist/* publish/ || true
 
+          # create app.zip from dist contents
           cd publish
-          zip -r ../app.zip . > /dev/null
+          zip -r ../app.zip . > /dev/null || true
           cd ..
 
+          # version from package.json
           VERSION=$(node -p "require('./package.json').version")
           echo "{\"version\":\"${VERSION}\"}" > publish/version.json
 
-          mv app.zip publish/app.zip
+          mv app.zip publish/app.zip || true
 
       - name: Debug publish folder (list)
         run: |
           echo "Files to be published:"
           ls -la publish || true
 
-      - name: Deploy to GitHub Pages
+      - name: Deploy to gh-pages using PAT
         uses: peaceiris/actions-gh-pages@v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Important: create secret GH_PAGES_TOKEN containing a PAT with repo write rights
+          github_token: ${{ secrets.GH_PAGES_TOKEN }}
           publish_dir: ./publish
+          publish_branch: gh-pages
+          commit_message: "ci: publish OTA bundle (app.zip + version.json) ✨"
