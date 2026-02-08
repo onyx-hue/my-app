@@ -5,10 +5,12 @@ import JSZip from 'jszip'
 import { Filesystem, Directory } from '@capacitor/filesystem'
 import { Preferences } from '@capacitor/preferences'
 import { Capacitor } from '@capacitor/core'
+import logger from './logger'
 
 const VERSION_URL = 'https://onyx-hue.github.io/my-app/version.json'
 const BUNDLE_URL = 'https://onyx-hue.github.io/my-app/app.zip'
 const LOCAL_WWW_DIR = 'www' // on écrira dans data/www/
+
 
 async function fileExists(path) {
   try {
@@ -20,63 +22,111 @@ async function fileExists(path) {
 }
 
 async function ensureDir(path) {
-  // Filesystem.mkdir échoue si le dossier existe déjà, donc on ignore les erreurs
   try {
     await Filesystem.mkdir({ path, directory: Directory.Data, recursive: true })
-  } catch (e) {
-    // ignore
-  }
+  } catch (e) { /* ignore */ }
 }
 
 export async function loadLocalIndexIfPresent() {
-  // Si un bundle local a déjà été appliqué, on charge index.html local
   const idxPath = `${LOCAL_WWW_DIR}/index.html`
-  if (!(await fileExists(idxPath))) return false
+  if (!(await fileExists(idxPath))) {
+    logger.info('loadLocalIndexIfPresent: no local index found')
+    return false
+  }
 
   try {
     const uriResult = await Filesystem.getUri({ directory: Directory.Data, path: idxPath })
-    const fileUri = uriResult.uri || uriResult // compat
+    const fileUri = uriResult.uri || uriResult
     const webFriendly = Capacitor.convertFileSrc(fileUri)
-    // Navigue vers le index local (remplace le contenu courant de la WebView)
+    logger.info('Loading local index: ' + webFriendly)
     window.location.href = webFriendly
     return true
   } catch (e) {
-    console.error('Erreur en chargeant index local', e)
+    logger.error('Erreur en chargeant index local: ' + e)
     return false
   }
 }
 
 export async function checkForUpdates(showPrompts = true) {
   try {
+    logger.info('Vérification de mise à jour en cours...')
     const r = await fetch(VERSION_URL + '?t=' + Date.now(), { cache: 'no-store' })
     if (!r.ok) {
-      console.warn('Impossible de récupérer version.json', r.status)
+      logger.warn('Impossible de récupérer version.json, code ' + r.status)
       return
     }
     const remote = await r.json()
     const local = await Preferences.get({ key: 'appVersion' })
     const localVersion = local?.value || '0.0.0'
+    logger.info(`Version locale=${localVersion} remote=${remote.version}`)
+
     if (localVersion === remote.version) {
-      console.log('OTA: déjà à jour', localVersion)
+      logger.info('OTA: déjà à jour')
       return
     }
 
-    console.log('OTA: nouvelle version détectée', remote.version)
-    // Télécharge le zip
+    logger.info('Nouvelle version détectée: ' + remote.version)
+    logger.info('Téléchargement du bundle...')
     const z = await fetch(BUNDLE_URL + '?t=' + Date.now())
-    if (!z.ok) throw new Error('Erreur téléchargement bundle: ' + z.status)
+    if (!z.ok) {
+      logger.error('Erreur téléchargement bundle: ' + z.status)
+      throw new Error('Erreur téléchargement bundle: ' + z.status)
+    }
+
+    // streaming progress: try to read and log progress if possible
+    try {
+      const reader = z.body?.getReader?.()
+      if (reader) {
+        let received = 0
+        const contentLength = +z.headers.get('Content-Length') || 0
+        logger.info('Taille annoncée: ' + (contentLength || 'inconnue') + ' bytes')
+        const chunks = []
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          chunks.push(value)
+          received += value.length
+          if (contentLength) {
+            const pct = Math.round((received / contentLength) * 100)
+            logger.info(`Download progress: ${pct}% (${received}/${contentLength})`)
+          } else {
+            logger.info(`Download received ${received} bytes`)
+          }
+        }
+        // concat
+        const total = chunks.reduce((acc, c) => {
+          const t = new Uint8Array(acc.length + c.length)
+          t.set(acc, 0)
+          t.set(c, acc.length)
+          return t
+        }, new Uint8Array())
+        const arrayBuffer = total.buffer
+        await _processZip(arrayBuffer, remote.version)
+        return
+      }
+    } catch (e) {
+      logger.warn('Progress streaming non disponible: ' + e)
+    }
+
+    // fallback: blob -> arrayBuffer
     const blob = await z.blob()
     const arrayBuffer = await blob.arrayBuffer()
-    // JSZip peut charger un ArrayBuffer directement
+    await _processZip(arrayBuffer, remote.version)
+
+  } catch (err) {
+    logger.error('OTA check failed: ' + (err && err.message ? err.message : err))
+  }
+}
+
+async function _processZip(arrayBuffer, remoteVersion) {
+  try {
+    logger.info('Extraction du zip...')
     const zip = await JSZip.loadAsync(arrayBuffer)
 
-    // Écrire chaque fichier du zip dans Directory.Data/www/...
-    // On parcourt toutes les entrées
     const writePromises = []
     zip.forEach((relativePath, zipEntry) => {
-      if (zipEntry.dir) return // ignorer dossiers
+      if (zipEntry.dir) return
       writePromises.push((async () => {
-        // s'assurer que le dossier existe
         const fullPath = `${LOCAL_WWW_DIR}/${relativePath}`
         const dir = fullPath.split('/').slice(0, -1).join('/')
         if (dir) await ensureDir(dir)
@@ -86,29 +136,16 @@ export async function checkForUpdates(showPrompts = true) {
           data: base64,
           directory: Directory.Data
         })
+        logger.info(`Wrote ${fullPath}`)
       })())
     })
 
     await Promise.all(writePromises)
-
-    // mise à jour de la version
-    await Preferences.set({ key: 'appVersion', value: remote.version })
-
-    if (showPrompts) {
-      // demander à l'utilisateur de recharger (ou recharger automatiquement)
-      if (confirm(`Nouvelle version (${remote.version}) téléchargée. Redémarrer pour appliquer ?`)) {
-        // charger le index local fraîchement écrit
-        const load = await loadLocalIndexIfPresent()
-        if (!load) {
-          // fallback : recharger la WebView (cela charge le bundle intégré si la navigation locale échoue)
-          window.location.reload()
-        }
-      }
-    } else {
-      // silent fallback: tenter de charger le local sans demander
-      await loadLocalIndexIfPresent()
-    }
-  } catch (err) {
-    console.error('OTA check failed', err)
+    await Preferences.set({ key: 'appVersion', value: remoteVersion })
+    logger.info('OTA: mise à jour téléchargée et appliquée localement (version=' + remoteVersion + ')')
+    // Option: loader showing prompt to restart is left to UI
+  } catch (e) {
+    logger.error('Erreur pendant extraction/écriture du zip: ' + e)
+    throw e
   }
 }
