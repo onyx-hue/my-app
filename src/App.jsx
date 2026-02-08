@@ -24,7 +24,7 @@ export default function App() {
 
   return (
     <div style={{ padding: 20 }}>
-      <h1>Mon App (UI de test)</h1>
+      <h1>Jolibois</h1>
       <p>Utilise le bouton ci-dessous pour forcer une vérification OTA et voir les logs en temps réel.</p>
 
       <div style={{ marginBottom: 12 }}>
