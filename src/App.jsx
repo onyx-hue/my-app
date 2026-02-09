@@ -46,7 +46,7 @@ export default function App() {
 
   return (
     <div style={{ padding: 16 }}>
-      <h1>Mon app — Debug OTA (mode sûr)</h1>
+      <h1>Grimm</h1>
 
       <div style={{ marginBottom: 12 }}>
         <button onClick={handleCheck} style={{ padding: 8 }}>Vérifier MAJ (manuel)</button>
