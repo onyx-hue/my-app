@@ -1,8 +1,13 @@
-// src/main.jsx
+import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App.jsx'
 
-// On lance React tout de suite. C'est App.jsx qui décidera d'afficher blanc, le site local, ou le menu debug.
-ReactDOM.createRoot(document.getElementById('root')).render(
-    <App />
-)
+// On utilise shell-root pour ne pas interférer avec le 'root' du bundle local
+const container = document.getElementById('shell-root');
+const root = ReactDOM.createRoot(container);
+
+root.render(
+    <React.StrictMode>
+      <App />
+    </React.StrictMode>
+);
