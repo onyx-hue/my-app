@@ -29,7 +29,7 @@ export default function App() {
 
   return (
     <div style={{ padding: 16 }}>
-      <h1>Mon app v{/* Tu peux lire la version ici si tu veux */}</h1>
+      <h1>Mon app OTA{/* Tu peux lire la version ici si tu veux */}</h1>
       
       <p>L'application vérifie les mises à jour en arrière-plan.</p>
       <p>Si une mise à jour est trouvée, elle sera appliquée au prochain redémarrage.</p>
