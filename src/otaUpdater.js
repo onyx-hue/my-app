@@ -1,10 +1,6 @@
 // src/otaUpdater.js
-// OTA helper — utilise JSZip + @capacitor/filesystem + @capacitor/preferences
-// Télécharge app.zip depuis GitHub Pages, extrait dans Directory.Data/www,
-// propose injection dans le DOM (pour garder l'UI React + console visible),
-// et fournit une fonction pour effacer le bundle local.
-//
-// URLs (déjà configurées pour ton repo)
+// OTA helper — injection améliorée (préserve les attributs des <script> et supporte les modules)
+// URLs configurées pour ton repo
 import JSZip from 'jszip'
 import { Filesystem, Directory } from '@capacitor/filesystem'
 import { Preferences } from '@capacitor/preferences'
@@ -13,7 +9,7 @@ import logger from './logger'
 
 const VERSION_URL = 'https://onyx-hue.github.io/my-app/version.json'
 const BUNDLE_URL = 'https://onyx-hue.github.io/my-app/app.zip'
-const LOCAL_WWW_DIR = 'www' // on écrit dans Directory.Data/www
+const LOCAL_WWW_DIR = 'www'
 
 async function fileExists(path) {
   try {
@@ -27,39 +23,28 @@ async function fileExists(path) {
 async function ensureDir(path) {
   try {
     await Filesystem.mkdir({ path, directory: Directory.Data, recursive: true })
-  } catch (e) {
-    // ignore if exists / or not supported
-  }
+  } catch (e) { /* ignore */ }
 }
 
-// Supprime le bundle local (safe): tentative d'appel Filesystem.rm, sinon ignore
 export async function clearLocalBundle() {
   try {
-    logger.info('clearLocalBundle: suppression du dossier local ' + LOCAL_WWW_DIR)
-    // try rm (some Capacitor versions support it)
+    logger.info('clearLocalBundle: removing ' + LOCAL_WWW_DIR)
     try {
       await Filesystem.rm({ path: LOCAL_WWW_DIR, directory: Directory.Data, recursive: true })
-      logger.info('clearLocalBundle: Filesystem.rm succeeded')
-    } catch (eRm) {
-      // fallback: try to remove files by listing
-      logger.warn('clearLocalBundle: Filesystem.rm not available or failed, fallback: ' + (eRm && eRm.message ? eRm.message : eRm))
-      try {
-        const list = await Filesystem.readdir({ path: LOCAL_WWW_DIR, directory: Directory.Data }).catch(() => ({ files: [] }))
-        if (list && list.files) {
-          // attempt to remove each file — this may not remove directories recursively on all platforms
-          for (const f of list.files) {
-            const full = `${LOCAL_WWW_DIR}/${f}`
-            try { await Filesystem.rm({ path: full, directory: Directory.Data, recursive: true }) } catch(e2) { /* ignore */ }
-          }
+      logger.info('clearLocalBundle: Filesystem.rm OK')
+    } catch (e) {
+      logger.warn('clearLocalBundle: rm fallback, error: ' + (e && e.message ? e.message : e))
+      // best-effort fallback: try readdir + rm each
+      const list = await Filesystem.readdir({ path: LOCAL_WWW_DIR, directory: Directory.Data }).catch(() => ({ files: [] }))
+      if (list && list.files) {
+        for (const f of list.files) {
+          try { await Filesystem.rm({ path: `${LOCAL_WWW_DIR}/${f}`, directory: Directory.Data, recursive: true }) } catch (_) {}
         }
-        // final attempt to remove the folder
-        try { await Filesystem.rm({ path: LOCAL_WWW_DIR, directory: Directory.Data, recursive: true }) } catch(e3) {}
-      } catch (e2) {
-        logger.warn('clearLocalBundle fallback removal failed: ' + (e2 && e2.message ? e2.message : e2))
       }
+      try { await Filesystem.rm({ path: LOCAL_WWW_DIR, directory: Directory.Data, recursive: true }) } catch (_) {}
     }
   } catch (e) {
-    logger.warn('clearLocalBundle: erreur during removal: ' + (e && e.message ? e.message : e))
+    logger.warn('clearLocalBundle: error: ' + (e && e.message ? e.message : e))
   }
 
   try {
@@ -70,9 +55,7 @@ export async function clearLocalBundle() {
   }
 }
 
-// Injecte index.html local dans un container DOM (id par défaut 'localAppContainer').
-// Cette méthode essaye d'ajouter <base> pour que les chemins relatifs résolvent vers le bundle local,
-// injecte link/style/meta dans le head courant et ré-exécute les scripts (séquentiellement).
+// ---------- injection du HTML local dans le container (préserve attributes, gère modules) ----------
 export async function injectLocalIndexIntoContainer(containerId = 'localAppContainer') {
   try {
     const idxPath = `${LOCAL_WWW_DIR}/index.html`
@@ -82,7 +65,7 @@ export async function injectLocalIndexIntoContainer(containerId = 'localAppConta
     }
 
     const file = await Filesystem.readFile({ path: idxPath, directory: Directory.Data })
-    const html = atob(file.data || file) // decode base64
+    const html = atob(file.data || file) // decode base64 to string
     const uriResult = await Filesystem.getUri({ directory: Directory.Data, path: idxPath })
     const fileUri = uriResult.uri || uriResult
     const webFriendly = Capacitor.convertFileSrc(fileUri)
@@ -92,14 +75,14 @@ export async function injectLocalIndexIntoContainer(containerId = 'localAppConta
 
     const container = document.getElementById(containerId)
     if (!container) {
-      logger.warn('injectLocalIndex: container introuvable: ' + containerId)
+      logger.warn('injectLocalIndex: container not found: ' + containerId)
       return false
     }
 
     const parser = new DOMParser()
     const doc = parser.parseFromString(html, 'text/html')
 
-    // ensure base tag
+    // ensure base tag so relative URLs resolve to local files
     let baseTag = doc.querySelector('base')
     if (!baseTag) {
       baseTag = doc.createElement('base')
@@ -107,13 +90,14 @@ export async function injectLocalIndexIntoContainer(containerId = 'localAppConta
     }
     baseTag.setAttribute('href', baseUrl)
 
-    // inject link/style/meta tags from bundle head into current head
+    // inject link/style/meta tags into current head (non-destructive)
     try {
       const temp = document.createElement('div')
       temp.innerHTML = doc.head.innerHTML
       Array.from(temp.children).forEach(node => {
-        const tagName = node.tagName && node.tagName.toLowerCase()
-        if (['link', 'style', 'meta'].includes(tagName)) {
+        const tag = node.tagName && node.tagName.toLowerCase()
+        if (['link', 'style', 'meta'].includes(tag)) {
+          // avoid duplicating identical tags too aggressively; simple clone is OK for debug
           document.head.appendChild(node.cloneNode(true))
         }
       })
@@ -121,38 +105,67 @@ export async function injectLocalIndexIntoContainer(containerId = 'localAppConta
       logger.warn('injectLocalIndex: error injecting head tags: ' + (e && e.message ? e.message : e))
     }
 
-    // set body
+    // set body content
     container.innerHTML = doc.body.innerHTML
 
-    // execute scripts sequentially and guarded
+    // find scripts in the parsed doc and re-create them preserving attributes
     const scripts = Array.from(doc.querySelectorAll('script'))
     for (const s of scripts) {
       try {
         const newScript = document.createElement('script')
+
+        // copy common attributes if present
+        const copyAttr = (name) => {
+          if (s.hasAttribute && s.hasAttribute(name)) {
+            newScript.setAttribute(name, s.getAttribute(name))
+          }
+        }
+        copyAttr('type')
+        copyAttr('nomodule')
+        copyAttr('defer')
+        copyAttr('async')
+        copyAttr('crossorigin')
+        copyAttr('integrity')
+
+        // determine if script should be module:
+        // If original had type="module" OR inline contains import / import.meta => module
+        const inlineText = s.textContent || ''
+        const looksLikeModule = (s.getAttribute && s.getAttribute('type') === 'module') ||
+                                /(^|\n|\s)import\s+|import\(|import\.meta/.test(inlineText)
+
         if (s.src) {
+          // external script: resolve relative to baseUrl and set type appropriately
           let src = s.getAttribute('src')
           try { src = new URL(src, baseUrl).toString() } catch (e) {}
           newScript.src = src
-          newScript.async = false
+          if (looksLikeModule) newScript.type = 'module'
+          newScript.async = false // keep order
+          // attach and wait for load or error to detect broken scripts
           container.appendChild(newScript)
-          logger.info('Injected external script: ' + src)
-          // wait for load or error to catch failures early
+          logger.info('Injected external script: ' + src + (looksLikeModule ? ' (module)' : ''))
           await new Promise((res, rej) => {
             newScript.onload = () => res(true)
-            newScript.onerror = () => rej(new Error('Script load failed: ' + src))
+            newScript.onerror = (ev) => rej(new Error('Script load failed: ' + src))
           })
         } else {
-          newScript.text = s.textContent || ''
-          container.appendChild(newScript)
+          // inline script
+          if (looksLikeModule) newScript.type = 'module'
+          try {
+            newScript.text = inlineText
+            container.appendChild(newScript)
+          } catch (e) {
+            logger.warn('injectLocalIndex: failed to append inline script, attempting execution via eval')
+            try { eval(inlineText) } catch (ee) { logger.error('eval inline script failed: ' + ee) }
+          }
         }
       } catch (e) {
         logger.error('injectLocalIndex: script injection error: ' + (e && e.message ? e.message : e))
-        // if a critical script fails to load, abort injection
+        // abort injection on critical script error
         return false
       }
     }
 
-    logger.info('injectLocalIndex: injection réussie')
+    logger.info('injectLocalIndex: injection succeeded')
     return true
   } catch (e) {
     logger.error('injectLocalIndex failed: ' + (e && e.message ? e.message : e))
@@ -160,15 +173,15 @@ export async function injectLocalIndexIntoContainer(containerId = 'localAppConta
   }
 }
 
-// Charge local index si présent: on tente d'injecter d'abord, sinon on navigue vers le fichier local (fallback)
 export async function loadLocalIndexIfPresent() {
+  // try injection first to keep UI
   const injected = await injectLocalIndexIntoContainer()
   if (injected) {
     logger.info('loadLocalIndexIfPresent: injected local index')
     return true
   }
 
-  // fallback navigation
+  // fallback navigation to local file (older method)
   try {
     const idxPath = `${LOCAL_WWW_DIR}/index.html`
     if (!(await fileExists(idxPath))) return false
@@ -184,7 +197,6 @@ export async function loadLocalIndexIfPresent() {
   }
 }
 
-// Check for updates: télécharge app.zip, extrait et écrit dans Directory.Data/www
 export async function checkForUpdates(showPrompts = true) {
   try {
     logger.info('checkForUpdates: starting')
@@ -210,7 +222,6 @@ export async function checkForUpdates(showPrompts = true) {
       return
     }
 
-    // téléchargement (fallback simple)
     const arrayBuffer = await z.arrayBuffer()
     logger.info('Bundle téléchargé (' + arrayBuffer.byteLength + ' bytes). Extraction...')
     const zip = await JSZip.loadAsync(arrayBuffer)
@@ -234,7 +245,7 @@ export async function checkForUpdates(showPrompts = true) {
 
     await Promise.all(writePromises)
     await Preferences.set({ key: 'appVersion', value: remote.version })
-    logger.info('OTA: bundle appliqué localement (version=' + remote.version + ')')
+    logger.info('OTA: bundle applied locally (version=' + remote.version + ')')
 
     if (showPrompts) {
       if (confirm(`Nouvelle version (${remote.version}) téléchargée. Charger maintenant ?`)) {

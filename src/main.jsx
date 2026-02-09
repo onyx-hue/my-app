@@ -4,17 +4,22 @@ import ReactDOM from 'react-dom/client'
 import App from './App.jsx'
 import { loadLocalIndexIfPresent, checkForUpdates } from './otaUpdater'
 
-// 1) Si un bundle local existe -> on bascule directement dessus (la fonction navigue et quitte si succès)
+// 1. On rend l'application TOUT DE SUITE pour s'assurer que le DOM (et #localAppContainer) existe.
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+)
+
+// 2. Ensuite, on vérifie si on doit injecter le contenu local par dessus
 loadLocalIndexIfPresent().then(found => {
-  if (!found) {
-    // 2) Sinon on démarre l'app normale et on vérifie en background si une update est dispo
-    ReactDOM.createRoot(document.getElementById('root')).render(
-      <React.StrictMode>
-        <App />
-      </React.StrictMode>
-    )
-    // vérifie en background (silent). Tu peux appeler sans paramètre ou avec true pour prompts.
+  if (found) {
+    // Si trouvé et injecté avec succès, l'écran sera mis à jour automatiquement
+    // car injectLocalIndexIntoContainer remplace le HTML du conteneur.
+    console.log('Bundle local chargé avec succès.')
+  } else {
+    // 3. Sinon, on lance la vérification de mise à jour en background
+    console.log('Pas de bundle local, vérification distante...')
     checkForUpdates(false)
-    // possibilité : checkForUpdates(true) si tu veux demander à l'utilisateur avant le reload
   }
 })

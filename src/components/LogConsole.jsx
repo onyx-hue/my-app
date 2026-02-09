@@ -34,21 +34,26 @@ export default function LogConsole({ initiallyOpen = false }) {
     URL.revokeObjectURL(url)
   }
 
+  const consoleStyle = {
+    position: 'fixed',
+    right: 8,
+    bottom: 8,
+    zIndex: 99999,
+    boxSizing: 'border-box',
+    fontFamily: 'monospace',
+    fontSize: 12,
+    color: '#fff',
+  }
+
   return (
     <div style={{
-      position: 'fixed',
-      right: 12,
-      bottom: 12,
-      width: open ? 520 : 48,
+      ...consoleStyle,
+      width: open ? 'min(680px, calc(100% - 24px))' : 48,
       height: open ? 360 : 48,
-      background: 'rgba(20,20,20,0.95)',
-      color: '#fff',
       borderRadius: 8,
+      background: 'rgba(20,20,20,0.95)',
       boxShadow: '0 8px 30px rgba(0,0,0,0.6)',
-      zIndex: 9999,
-      overflow: 'hidden',
-      fontFamily: 'monospace',
-      fontSize: 12
+      overflow: 'hidden'
     }}>
       <div style={{ display: 'flex', alignItems: 'center', padding: '6px 8px', gap: 8, background: 'rgba(255,255,255,0.03)' }}>
         <button onClick={() => setOpen(o => !o)} style={{ padding: 6 }}>
@@ -66,10 +71,10 @@ export default function LogConsole({ initiallyOpen = false }) {
       </div>
 
       {open ? (
-        <div ref={containerRef} style={{ padding: 8, height: 'calc(100% - 40px)', overflowY: 'auto' }}>
+        <div ref={containerRef} style={{ padding: 8, height: 'calc(100% - 40px)', overflowY: 'auto', paddingRight: 12 }}>
           {logs.length === 0 && <div style={{ color: 'rgba(255,255,255,0.6)' }}>Aucun log</div>}
           {logs.map((l, i) => (
-            <div key={i} style={{ marginBottom: 6, lineHeight: '1.2' }}>
+            <div key={i} style={{ marginBottom: 6, lineHeight: '1.2', wordBreak: 'break-word' }}>
               <div style={{ color: 'rgba(255,255,255,0.55)' }}>{l.ts}</div>
               <div>
                 <span style={{
@@ -80,7 +85,7 @@ export default function LogConsole({ initiallyOpen = false }) {
                   color: '#fff',
                   fontWeight: 700
                 }}>{l.level.toUpperCase()}</span>
-                <span style={{ color: '#fff' }}>{l.msg}</span>
+                <span style={{ color: '#fff', whiteSpace: 'pre-wrap' }}>{l.msg}</span>
               </div>
             </div>
           ))}
