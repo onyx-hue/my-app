@@ -46,7 +46,7 @@ export default function App() {
 
   return (
     <div style={{ padding: 16 }}>
-      <h1>Nouveau titre de mon app</h1>
+      <h1>Nouveau</h1>
 
       <div style={{ marginBottom: 12 }}>
         <button onClick={handleCheck} style={{ padding: 8 }}>Vérifier MAJ (manuel)</button>
