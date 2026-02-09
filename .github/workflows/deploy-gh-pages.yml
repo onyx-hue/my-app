@@ -55,9 +55,18 @@ jobs:
           zip -r ../app.zip . > /dev/null || true
           cd ..
 
-          # version from package.json
+          # --- MODIFICATION ICI ---
+          # 1. On garde la version pour l'affichage dans les logs de l'app
           VERSION=$(node -p "require('./package.json').version")
-          echo "{\"version\":\"${VERSION}\"}" > publish/version.json
+          
+          # 2. On génère un ID unique basé sur l'heure actuelle (timestamp unix)
+          BUILD_ID=$(date +%s)
+          
+          echo "Génération du version.json avec Build ID: $BUILD_ID"
+          
+          # 3. On écrit le JSON avec les deux infos
+          echo "{\"version\":\"${VERSION}\", \"buildId\":\"${BUILD_ID}\"}" > publish/version.json
+          # ------------------------
 
           mv app.zip publish/app.zip || true
 
@@ -73,4 +82,4 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./publish
           publish_branch: gh-pages
-          commit_message: "ci: publish OTA bundle (app.zip + version.json) ✨"
+          commit_message: "ci: publish OTA bundle (app.zip + version.json + buildId) ✨"
