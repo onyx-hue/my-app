@@ -65,7 +65,7 @@ export default function App() {
       {/* Si et seulement si on n'a PAS trouvé de site local, on affiche ton interface de debug */}
       {mode === 'default' && (
         <div style={{ padding: 16 }}>
-          <h1>Application Par Défaut (Fallback)</h1>
+          <h1>Grimdel</h1>
           <p>Aucune version locale trouvée. Téléchargement en cours en arrière-plan...</p>
           <p>Au prochain démarrage, la nouvelle version s'affichera ici.</p>
           
