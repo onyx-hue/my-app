@@ -1,77 +1,70 @@
-import React, { useEffect, useState, useRef } from 'react'
+// src/App.jsx
+import React, { useState } from 'react'
 import LogConsole from './components/LogConsole'
 import { checkForUpdates, loadLocalIndexIfPresent, clearLocalBundle } from './otaUpdater'
 import logger from './logger'
 
 export default function App() {
-  const [mode, setMode] = useState('booting') 
-  const mountedRef = useRef(false)
+  const [status, setStatus] = useState('idle')
 
-  useEffect(() => {
-    if (mountedRef.current) return
-    mountedRef.current = true
+  const handleCheck = async () => {
+    setStatus('checking')
+    await checkForUpdates(true)
+    setStatus('idle')
+  }
 
-    const bootSequence = async () => {
-      // 1. Essayer de charger le site local (injecte dans localAppContainer)
-      const loaded = await loadLocalIndexIfPresent('localAppContainer')
-
-      if (loaded) {
-        setMode('local')
-        logger.info('Mode Local activé : Le bundle a été injecté.')
-      } else {
-        setMode('default')
-        logger.info('Mode Défaut activé : Utilisation de l’interface de secours.')
+  const handleLoadLocal = async () => {
+    setStatus('loading-local')
+    try {
+      const ok = await loadLocalIndexIfPresent()
+      if (!ok) {
+        logger.warn('Aucun bundle local trouvé ou échec de chargement.')
+        alert('Aucun bundle local présent ou échec de chargement. Vérifie les logs.')
       }
-
-      // 2. Vérification silencieuse de mise à jour en arrière-plan
-      checkForUpdates(false)
+    } catch (e) {
+      logger.error('Erreur loadLocal: ' + e)
+      alert('Erreur lors du chargement local — voir la console.')
+    } finally {
+      setStatus('idle')
     }
+  }
 
-    bootSequence()
-  }, [])
+  const handleReset = async () => {
+    if (!confirm('Supprimer le bundle local et revenir au contenu embarqué ?')) return
+    setStatus('resetting')
+    try {
+      await clearLocalBundle()
+      logger.info('Reset effectué — redémarrage de l\'app pour charger le bundle embarqué.')
+      // reload to use bundled assets
+      window.location.reload()
+    } catch (e) {
+      logger.error('Reset failed: ' + e)
+    } finally {
+      setStatus('idle')
+    }
+  }
 
   return (
-    <div style={{ width: '100vw', height: '100vh', overflow: 'hidden' }}>
-      
-      {/* Conteneur pour le bundle téléchargé */}
-      <div 
-        id="localAppContainer" 
-        style={{ 
-          display: mode === 'local' ? 'block' : 'none',
-          width: '100%',
-          height: '100%',
-          position: 'absolute',
-          top: 0,
-          left: 0
-        }} 
-      />
+    <div style={{ padding: 16 }}>
+      <h1>Mon app — Debug OTA (mode sûr)</h1>
 
-      {/* Écran de chargement initial */}
-      {mode === 'booting' && (
-        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100%' }}>
-          <p>Initialisation...</p>
-        </div>
-      )}
+      <div style={{ marginBottom: 12 }}>
+        <button onClick={handleCheck} style={{ padding: 8 }}>Vérifier MAJ (manuel)</button>
+        <button onClick={handleLoadLocal} style={{ marginLeft: 8, padding: 8 }}>Charger bundle local</button>
+        <button onClick={handleReset} style={{ marginLeft: 8, padding: 8, background: '#d9534f', color: '#fff' }}>
+          Reset bundle local
+        </button>
+      </div>
 
-      {/* Interface de secours (visible uniquement si pas de bundle local) */}
-      {mode === 'default' && (
-        <div style={{ padding: 20 }}>
-          <h1>Grimdel</h1>
-          <p>Recherche de mise à jour en cours...</p>
-          <hr />
-          <button onClick={() => checkForUpdates(true)}>Vérifier maintenant</button>
-          <button 
-            onClick={async () => { await clearLocalBundle(); window.location.reload(); }} 
-            style={{ marginLeft: 10, background: '#d9534f', color: 'white' }}
-          >
-            Reset Bundle
-          </button>
-          <LogConsole initiallyOpen={true} />
-        </div>
-      )}
+      <div style={{ marginTop: 8, marginBottom: 12 }}>
+        <strong>Statut:</strong> {status}
+      </div>
 
-      {/* La console reste accessible même en mode local via un petit bouton (géré dans LogConsole) */}
-      {mode === 'local' && <LogConsole initiallyOpen={false} />}
+      <div id="localAppContainer" style={{ border: '1px dashed #ccc', minHeight: 320, padding: 8 }}>
+        <p style={{ color: '#666' }}>Contenu local injecté (si tu appuies sur "Charger bundle local").</p>
+      </div>
+
+      <LogConsole initiallyOpen={true} />
     </div>
   )
 }
