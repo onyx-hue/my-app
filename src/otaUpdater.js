@@ -1,6 +1,5 @@
 // src/otaUpdater.js
-// OTA updater avec stratégie "backup -> tmp -> swap -> cleanup" (échange atomique)
-// Remplace entièrement le fichier précédent.
+// OTA updater (version corrigée) — atomic update with robust delete fallback & readdir handling
 
 import JSZip from 'jszip'
 import { Filesystem, Directory } from '@capacitor/filesystem'
@@ -8,9 +7,7 @@ import { Preferences } from '@capacitor/preferences'
 import { Capacitor } from '@capacitor/core'
 import logger from './logger'
 
-/**
- * Config
- */
+/* ---------------- Config ---------------- */
 const VERSION_URL = 'https://onyx-hue.github.io/my-app/version.json'
 const BUNDLE_URL = 'https://onyx-hue.github.io/my-app/app.zip'
 
@@ -19,11 +16,10 @@ const TMP_WWW_DIR = 'www_tmp'
 const BACKUP_WWW_DIR = 'www_backup'
 
 const KEY_VERSION = 'appVersion'
-const KEY_BUILD_ID = 'appBuildId' // timestamp / build id
+const KEY_BUILD_ID = 'appBuildId'
+const KEY_UPDATE_IN_PROGRESS = 'updateInProgress'
 
-/**
- * Helpers Filesystem
- */
+/* -------------- Helpers FS --------------- */
 async function fileExists(path) {
   try {
     await Filesystem.stat({ path, directory: Directory.Data })
@@ -36,36 +32,195 @@ async function fileExists(path) {
 async function ensureDir(path) {
   try {
     await Filesystem.mkdir({ path, directory: Directory.Data, recursive: true })
-  } catch (e) { /* ignore if exists */ }
-}
-
-async function removeDirIfExists(path) {
-  try {
-    if (await fileExists(path)) {
-      await Filesystem.rm({ path, directory: Directory.Data, recursive: true })
-    }
   } catch (e) {
-    logger.warn('removeDirIfExists error: ' + (e && e.message ? e.message : e))
+    // ignore if exists/permission
   }
 }
 
 /**
- * Copie récursive d'un dossier dans un autre (lecture base64 -> écriture base64).
- * Note: copie fichier par fichier via readFile/writeFile.
+ * safeRm(path) :
+ * - essaie Filesystem.rm si présent,
+ * - sinon tente plusieurs méthodes alternatives exposées par le plugin,
+ * - sinon effectue une suppression récursive manuelle via fallbackDeleteDir.
+ */
+async function safeRm(path) {
+  // direct call if implemented
+  try {
+    if (typeof Filesystem.rm === 'function') {
+      await Filesystem.rm({ path, directory: Directory.Data, recursive: true })
+      return
+    }
+  } catch (e) {
+    // si NotImplemented ou autre -> on passe au fallback
+    logger.warn(`safeRm: Filesystem.rm failed: ${e && e.message ? e.message : e}`)
+  }
+
+  // Try some possible alternative method names that some Capacitor builds might expose
+  const candidateFns = ['deleteFile', 'removeFile', 'unlink', 'rmdir', 'rmrf', 'remove'] // best-effort
+  for (const fn of candidateFns) {
+    try {
+      if (typeof Filesystem[fn] === 'function') {
+        // attempt to call with likely signatures
+        try {
+          // try recursive true
+          await Filesystem[fn]({ path, directory: Directory.Data, recursive: true })
+        } catch (_) {
+          // fallback to non-recursive
+          await Filesystem[fn]({ path, directory: Directory.Data })
+        }
+        return
+      }
+    } catch (e) {
+      logger.warn(`safeRm: candidate ${fn} failed: ${e && e.message ? e.message : e}`)
+    }
+  }
+
+  // Last resort: manual recursive delete by listing content and deleting files
+  try {
+    await fallbackDeleteDir(path)
+    return
+  } catch (e) {
+    logger.warn('safeRm: fallbackDeleteDir failed: ' + (e && e.message ? e.message : e))
+    throw e
+  }
+}
+
+/**
+ * fallbackDeleteDir(path) :
+ * récursive : lit le dossier puis supprime fichier par fichier / dossier par dossier.
+ * Gère le cas où readdir() renvoie des strings ou des objets { name, uri, ... }.
+ */
+async function fallbackDeleteDir(path) {
+  logger.info('fallbackDeleteDir: ' + path)
+  // list entries
+  let list = { files: [] }
+  try {
+    list = await Filesystem.readdir({ path, directory: Directory.Data })
+  } catch (e) {
+    // if readdir fails because dir doesn't exist, nothing to do
+    logger.warn('fallbackDeleteDir: readdir failed for ' + path + ' -> ' + (e && e.message ? e.message : e))
+    throw e
+  }
+
+  const entries = list && list.files ? list.files : []
+
+  for (const entry of entries) {
+    // normalize name (entry can be string or object)
+    let name
+    if (typeof entry === 'string') name = entry
+    else if (entry && typeof entry === 'object' && ('name' in entry)) name = entry.name
+    else if (entry && typeof entry === 'object' && ('uri' in entry)) {
+      // sometimes entry.uri contains path-like data; try to derive a name
+      name = String(entry.uri).split('/').pop()
+    } else {
+      // fallback to string-conversion
+      name = String(entry)
+    }
+    const childPath = path + '/' + name
+
+    // try stat to know if directory
+    let st = null
+    try {
+      st = await Filesystem.stat({ path: childPath, directory: Directory.Data })
+    } catch (e) {
+      // if stat fails, assume it's a file and try deletion
+      st = null
+    }
+
+    if (st && st.type === 'directory') {
+      // recursive
+      await fallbackDeleteDir(childPath)
+      // after children removed, try to remove the empty directory with safeRm on it (may be no-op)
+      try { await safeRm(childPath) } catch (e) { /* ignore */ }
+    } else {
+      // try to remove file via available methods
+      let deleted = false
+      try {
+        // attempt Filesystem.rm file
+        if (typeof Filesystem.rm === 'function') {
+          await Filesystem.rm({ path: childPath, directory: Directory.Data, recursive: false })
+          deleted = true
+        }
+      } catch (e) { /* ignore */ }
+
+      if (!deleted) {
+        // try a set of alternative delete methods
+        const alt = ['deleteFile', 'removeFile', 'unlink', 'remove']
+        for (const fn of alt) {
+          try {
+            if (typeof Filesystem[fn] === 'function') {
+              await Filesystem[fn]({ path: childPath, directory: Directory.Data })
+              deleted = true
+              break
+            }
+          } catch (e) {
+            // continue trying other function names
+          }
+        }
+      }
+
+      if (!deleted) {
+        // fallback: try to write empty file (overwrite), then rm the parent later
+        try {
+          await Filesystem.writeFile({ path: childPath, data: '', directory: Directory.Data })
+          // attempt remove again
+          try { await safeRm(childPath) } catch (_) {}
+        } catch (e) {
+          logger.warn('fallbackDeleteDir: unable to delete file ' + childPath + ' : ' + (e && e.message ? e.message : e))
+        }
+      }
+    }
+  }
+
+  // finally attempt to remove the directory itself
+  try {
+    if (typeof Filesystem.rm === 'function') {
+      await Filesystem.rm({ path, directory: Directory.Data, recursive: false })
+    } else {
+      // try candidate rmdir-like names
+      const candidates = ['rmdir', 'removeDir', 'remove', 'deleteDir']
+      for (const c of candidates) {
+        if (typeof Filesystem[c] === 'function') {
+          try { await Filesystem[c]({ path, directory: Directory.Data }) ; break } catch (e) {}
+        }
+      }
+    }
+  } catch (e) {
+    // ignore not-critical
+    logger.warn('fallbackDeleteDir: final removal of dir failed: ' + (e && e.message ? e.message : e))
+  }
+}
+
+/* -------------- Copy Dir Helper --------------- */
+/**
+ * copyDir(src, dst)
+ * - gère les entrées de readdir qui sont string ou objets
+ * - lit file.data (base64) et écrit directement sur dst
  */
 async function copyDir(src, dst) {
   logger.info(`copyDir: ${src} -> ${dst}`)
-  // ensure dst exists
   await ensureDir(dst)
 
-  const list = await Filesystem.readdir({ path: src, directory: Directory.Data }).catch(() => ({ files: [] }))
+  let list = { files: [] }
+  try {
+    list = await Filesystem.readdir({ path: src, directory: Directory.Data })
+  } catch (e) {
+    logger.warn('copyDir: readdir failed for ' + src + ' : ' + (e && e.message ? e.message : e))
+    throw e
+  }
+
   const files = list && list.files ? list.files : []
 
-  for (const name of files) {
+  for (const ent of files) {
+    let name
+    if (typeof ent === 'string') name = ent
+    else if (ent && typeof ent === 'object' && 'name' in ent) name = ent.name
+    else name = String(ent)
+
     const srcPath = `${src}/${name}`
     const dstPath = `${dst}/${name}`
 
-    // heuristique : essayer stat pour savoir si dossier
+    // stat to check directory
     let stat = null
     try {
       stat = await Filesystem.stat({ path: srcPath, directory: Directory.Data })
@@ -75,33 +230,26 @@ async function copyDir(src, dst) {
 
     if (stat && stat.type === 'directory') {
       await copyDir(srcPath, dstPath)
-    } else if (name.endsWith('/')) {
-      // defensive: skip
-      continue
     } else {
       try {
         const file = await Filesystem.readFile({ path: srcPath, directory: Directory.Data })
-        // file.data est base64 (selon ton usage existant)
-        await ensureDir(dst) // ensure parent
-        await Filesystem.writeFile({ path: dstPath, data: file.data, directory: Directory.Data })
+        const base64 = file && (file.data || file)
+        const parent = dstPath.split('/').slice(0, -1).join('/')
+        if (parent) await ensureDir(parent)
+        await Filesystem.writeFile({ path: dstPath, data: base64, directory: Directory.Data })
       } catch (e) {
-        logger.warn(`copyDir: erreur fichier ${srcPath} -> ${dstPath}: ${e && e.message ? e.message : e}`)
+        logger.warn(`copyDir: error copying ${srcPath} -> ${dstPath} : ${e && e.message ? e.message : e}`)
         throw e
       }
     }
   }
 }
 
-/**
- * Écrit le contenu d'un JSZip dans un dossier spécifique (base64)
- * zip: instance JSZip
- * dir: target directory (ex: TMP_WWW_DIR)
- */
+/* ---------- Write zip -> dir ---------- */
 async function writeZipToDir(zip, dir) {
   logger.info('writeZipToDir -> ' + dir)
   await ensureDir(dir)
   const tasks = []
-
   zip.forEach((relativePath, zipEntry) => {
     if (zipEntry.dir) return
     tasks.push((async () => {
@@ -112,14 +260,10 @@ async function writeZipToDir(zip, dir) {
       await Filesystem.writeFile({ path: fullPath, data: base64, directory: Directory.Data })
     })())
   })
-
   await Promise.all(tasks)
 }
 
-/**
- * injectLocalIndexIntoContainer adapté pour accepter un dossier arbitraire (dir param)
- * Par défaut dir = LOCAL_WWW_DIR (comportement ancien)
- */
+/* ---------- Injection (support dir param) ---------- */
 export async function injectLocalIndexIntoContainer(containerId = 'localAppContainer', dir = LOCAL_WWW_DIR) {
   try {
     const idxPath = `${dir}/index.html`
@@ -129,13 +273,11 @@ export async function injectLocalIndexIntoContainer(containerId = 'localAppConta
     }
 
     const file = await Filesystem.readFile({ path: idxPath, directory: Directory.Data })
-    // file.data est base64 => décoder proprement en UTF-8
     const b64 = file.data || file
-    // Base64 -> Uint8Array -> string UTF-8
-    const binaryString = atob(b64)
-    const len = binaryString.length
-    const bytes = new Uint8Array(len)
-    for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i)
+    // base64 -> uint8array -> utf8 string
+    const bin = atob(b64)
+    const bytes = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
     const html = new TextDecoder('utf-8').decode(bytes)
 
     const uriResult = await Filesystem.getUri({ directory: Directory.Data, path: idxPath })
@@ -156,7 +298,7 @@ export async function injectLocalIndexIntoContainer(containerId = 'localAppConta
     }
     baseTag.setAttribute('href', baseUrl)
 
-    // Injection Head (link, meta, style)
+    // inject head (link/style/meta)
     try {
       const temp = document.createElement('div')
       temp.innerHTML = doc.head.innerHTML
@@ -170,10 +312,8 @@ export async function injectLocalIndexIntoContainer(containerId = 'localAppConta
       logger.warn('injectLocalIndex: error injecting head: ' + (e && e.message ? e.message : e))
     }
 
-    // Remplacer le body
     container.innerHTML = doc.body.innerHTML
 
-    // Recréation contrôlée des scripts
     const scripts = Array.from(doc.querySelectorAll('script'))
     for (const s of scripts) {
       try {
@@ -186,7 +326,7 @@ export async function injectLocalIndexIntoContainer(containerId = 'localAppConta
 
         if (s.src) {
           let src = s.getAttribute('src')
-          try { src = new URL(src, baseUrl).toString() } catch (e) { /* keep as-is */ }
+          try { src = new URL(src, baseUrl).toString() } catch (e) {}
           newScript.src = src
           if (looksLikeModule) newScript.type = 'module'
           newScript.async = false
@@ -196,9 +336,7 @@ export async function injectLocalIndexIntoContainer(containerId = 'localAppConta
           newScript.text = inlineText
           container.appendChild(newScript)
         }
-      } catch (e) {
-        // ignore script errors to avoid plantage complet
-      }
+      } catch (e) { /* ignore individual script errors */ }
     }
 
     return true
@@ -208,26 +346,20 @@ export async function injectLocalIndexIntoContainer(containerId = 'localAppConta
   }
 }
 
-/**
- * loadLocalIndexIfPresent : essaie l'injection depuis LOCAL_WWW_DIR,
- * sinon tente le redirect classique. On effectue aussi une récupération si backup existant.
- */
+/* --------- loadLocalIndexIfPresent (with recovery) --------- */
 export async function loadLocalIndexIfPresent() {
-  // recovery step: si backup existe et www absent -> restore
   try {
     await recoverIfNeeded()
   } catch (e) {
     logger.warn('loadLocalIndexIfPresent: recoverIfNeeded error: ' + (e && e.message ? e.message : e))
   }
 
-  // Try inject first
   const injected = await injectLocalIndexIntoContainer('localAppContainer', LOCAL_WWW_DIR)
   if (injected) {
     logger.info('loadLocalIndexIfPresent: injected local index (container)')
     return true
   }
 
-  // fallback : redirect to local index file
   try {
     const idxPath = `${LOCAL_WWW_DIR}/index.html`
     if (!(await fileExists(idxPath))) return false
@@ -242,159 +374,139 @@ export async function loadLocalIndexIfPresent() {
   }
 }
 
-/**
- * Nettoyage complet du bundle local (identique à ton code)
- */
+/* ------------ clearLocalBundle (improved) ------------- */
 export async function clearLocalBundle() {
   try {
     logger.info('clearLocalBundle: removing ' + LOCAL_WWW_DIR)
     try {
-      await Filesystem.rm({ path: LOCAL_WWW_DIR, directory: Directory.Data, recursive: true })
-      logger.info('clearLocalBundle: Filesystem.rm OK')
+      await safeRm(LOCAL_WWW_DIR)
+      logger.info('clearLocalBundle: safeRm OK')
     } catch (e) {
-      logger.warn('clearLocalBundle: rm fallback...')
-      const list = await Filesystem.readdir({ path: LOCAL_WWW_DIR, directory: Directory.Data }).catch(() => ({ files: [] }))
-      if (list && list.files) {
-        for (const f of list.files) {
-          try { await Filesystem.rm({ path: `${LOCAL_WWW_DIR}/${f}`, directory: Directory.Data, recursive: true }) } catch (_) {}
-        }
+      logger.warn('clearLocalBundle: safeRm failed, attempting fallback per-file removal: ' + (e && e.message ? e.message : e))
+      try {
+        await fallbackDeleteDir(LOCAL_WWW_DIR)
+      } catch (er) {
+        logger.warn('clearLocalBundle: fallbackDeleteDir also failed: ' + (er && er.message ? er.message : er))
       }
-      try { await Filesystem.rm({ path: LOCAL_WWW_DIR, directory: Directory.Data, recursive: true }) } catch (_) {}
     }
   } catch (e) {
     logger.warn('clearLocalBundle: error: ' + (e && e.message ? e.message : e))
   }
 
-  // Reset prefs
   try {
     await Preferences.set({ key: KEY_VERSION, value: '0.0.0' })
     await Preferences.remove({ key: KEY_BUILD_ID })
+    await Preferences.remove({ key: KEY_UPDATE_IN_PROGRESS })
     logger.info('clearLocalBundle: preferences reset')
   } catch (e) {
     logger.warn('clearLocalBundle: unable to reset preferences: ' + (e && e.message ? e.message : e))
   }
 }
 
-/**
- * Recovery au démarrage si un backup est présent mais le www est absent/corrompu.
- * Comportement :
- *  - si BACKUP_WWW_DIR existe et LOCAL_WWW_DIR absent => restore (copy backup -> www), supprimer backup
- *  - si BACKUP_WWW_DIR existe et LOCAL_WWW_DIR existe => on conserve le backup (optionnel: supprimer)
- */
+/* ------------- Recovery -------------- */
 async function recoverIfNeeded() {
   const backupExists = await fileExists(BACKUP_WWW_DIR)
   const wwwExists = await fileExists(LOCAL_WWW_DIR)
-  if (!backupExists) return
 
-  logger.info('recoverIfNeeded: found backup dir: ' + BACKUP_WWW_DIR)
-  if (!wwwExists) {
-    logger.info('recoverIfNeeded: www absent -> restoring backup')
+  // if an update flag is present, try to recover
+  try {
+    const inProg = await Preferences.get({ key: KEY_UPDATE_IN_PROGRESS })
+    if (inProg && inProg.value) {
+      logger.info('recoverIfNeeded: found updateInProgress flag, attempting recovery or cleanup')
+      // if backup exists and www is missing -> restore
+      if (backupExists && !wwwExists) {
+        logger.info('recoverIfNeeded: restoring backup -> www')
+        await copyDir(BACKUP_WWW_DIR, LOCAL_WWW_DIR)
+        try { await safeRm(BACKUP_WWW_DIR) } catch (e) {}
+      }
+      await Preferences.remove({ key: KEY_UPDATE_IN_PROGRESS })
+    }
+  } catch (e) {
+    logger.warn('recoverIfNeeded: error checking updateInProgress flag: ' + (e && e.message ? e.message : e))
+  }
+
+  // If backup exists and www is missing (no flag), still restore
+  if (backupExists && !wwwExists) {
+    logger.info('recoverIfNeeded: backup found and www missing -> restoring backup')
     await copyDir(BACKUP_WWW_DIR, LOCAL_WWW_DIR)
-    await removeDirIfExists(BACKUP_WWW_DIR)
-    logger.info('recoverIfNeeded: restore done')
-  } else {
-    // Situation ambigüe (backup present and www present). On garde le backup par sécurité.
-    logger.info('recoverIfNeeded: both backup and www exist -> leaving backup in place for safety')
+    try { await safeRm(BACKUP_WWW_DIR) } catch (e) {}
   }
 }
 
-/**
- * Effectue l'échange atomique :
- * 1) sauvegarde www -> BACKUP_WWW_DIR
- * 2) écriture du zip dans TMP_WWW_DIR
- * 3) test d'injection depuis TMP_WWW_DIR
- * 4) si OK : supprimer www, copier TMP_WWW_DIR -> www, supprimer TMP_WWW_DIR, supprimer BACKUP_WWW_DIR
- * 5) si KO : restaurer depuis BACKUP_WWW_DIR (si présent) et supprimer TMP_WWW_DIR
- */
+/* ------------- Atomic update flow -------------- */
 async function performAtomicUpdateFromZip(arrayBuffer) {
   try {
     logger.info('performAtomicUpdateFromZip: starting atomic update')
+    // set flag
+    await Preferences.set({ key: KEY_UPDATE_IN_PROGRESS, value: '1' })
 
-    // 1) cleanup tmp and backup (pour état propre)
-    await removeDirIfExists(TMP_WWW_DIR)
-    // if a previous backup exists, remove it (or you can keep multiple backups, ici on écrase)
-    await removeDirIfExists(BACKUP_WWW_DIR)
+    // cleanup tmp and backup
+    try { await safeRm(TMP_WWW_DIR) } catch (e) {}
+    try { await safeRm(BACKUP_WWW_DIR) } catch (e) {}
 
-    // 2) create backup if www exists
+    // create backup if exists
     if (await fileExists(LOCAL_WWW_DIR)) {
       logger.info('performAtomicUpdateFromZip: creating backup from ' + LOCAL_WWW_DIR)
       await copyDir(LOCAL_WWW_DIR, BACKUP_WWW_DIR)
-    } else {
-      logger.info('performAtomicUpdateFromZip: no existing www to backup')
     }
 
-    // 3) extract zip into TMP_WWW_DIR
+    // extract zip into TMP_WWW_DIR
     logger.info('performAtomicUpdateFromZip: extracting zip into tmp dir')
     const zip = await JSZip.loadAsync(arrayBuffer)
     await writeZipToDir(zip, TMP_WWW_DIR)
 
-    // 4) test injection depuis TMP_WWW_DIR (n'affiche rien si showPrompts false)
+    // test injection from tmp
     logger.info('performAtomicUpdateFromZip: testing injection from tmp dir')
     const injectedTmp = await injectLocalIndexIntoContainer('localAppContainer', TMP_WWW_DIR)
     if (!injectedTmp) {
-      // tentative fallback : redirect vers tmp index (peut échouer en contexte in-app)
-      try {
-        const idxPath = `${TMP_WWW_DIR}/index.html`
-        if (await fileExists(idxPath)) {
-          const uriResult = await Filesystem.getUri({ directory: Directory.Data, path: idxPath })
-          const fileUri = uriResult.uri || uriResult
-          const webFriendly = Capacitor.convertFileSrc(fileUri)
-          // attention : redirection ici fera quitter l'UI "native"
-          window.location.href = webFriendly
-          // si redirect ok on ne revient pas en JS ; si on revient c'est que ça a échoué
-          return true
-        }
-      } catch (e) { /* ignore */ }
-
-      // injection tmp a échoué -> restaure depuis backup
-      logger.warn('performAtomicUpdateFromZip: injection from tmp failed -> will restore backup')
-      // cleanup tmp
-      await removeDirIfExists(TMP_WWW_DIR)
+      logger.warn('performAtomicUpdateFromZip: injection from tmp failed -> cleaning tmp and restoring (if backup)')
+      try { await safeRm(TMP_WWW_DIR) } catch (e) {}
       if (await fileExists(BACKUP_WWW_DIR)) {
-        // restore backup -> www
         await copyDir(BACKUP_WWW_DIR, LOCAL_WWW_DIR)
+        try { await safeRm(BACKUP_WWW_DIR) } catch (e) {}
       }
+      await Preferences.remove({ key: KEY_UPDATE_IN_PROGRESS })
       return false
     }
 
-    // 5) injection depuis tmp a fonctionné => appliquer le swap
-    logger.info('performAtomicUpdateFromZip: tmp injection OK -> applying swap')
-
-    // supprimer l'ancien www (on l'a déjà backupé)
-    await removeDirIfExists(LOCAL_WWW_DIR)
-
-    // copier tmp -> www (effectue le "move")
+    // apply swap: remove old www, copy tmp -> www
+    logger.info('performAtomicUpdateFromZip: applying swap (tmp -> www)')
+    try { await safeRm(LOCAL_WWW_DIR) } catch (e) {}
     await copyDir(TMP_WWW_DIR, LOCAL_WWW_DIR)
 
-    // supprimer tmp
-    await removeDirIfExists(TMP_WWW_DIR)
+    // cleanup tmp & backup
+    try { await safeRm(TMP_WWW_DIR) } catch (e) {}
+    try { await safeRm(BACKUP_WWW_DIR) } catch (e) {}
 
-    // supprimer backup (on a réussi)
-    await removeDirIfExists(BACKUP_WWW_DIR)
+    // remove flag
+    await Preferences.remove({ key: KEY_UPDATE_IN_PROGRESS })
 
-    logger.info('performAtomicUpdateFromZip: atomic update success')
+    // re-inject from real LOCAL_WWW_DIR to set correct base URLs
+    try {
+      await injectLocalIndexIntoContainer('localAppContainer', LOCAL_WWW_DIR)
+    } catch (e) { /* ignore */ }
+
+    logger.info('performAtomicUpdateFromZip: success')
     return true
   } catch (e) {
     logger.error('performAtomicUpdateFromZip failed: ' + (e && e.message ? e.message : e))
-    // Tentative de restauration
+    // try to restore from backup
     try {
-      await removeDirIfExists(TMP_WWW_DIR)
+      await safeRm(TMP_WWW_DIR)
       if (await fileExists(BACKUP_WWW_DIR)) {
-        await removeDirIfExists(LOCAL_WWW_DIR)
+        await safeRm(LOCAL_WWW_DIR)
         await copyDir(BACKUP_WWW_DIR, LOCAL_WWW_DIR)
-        await removeDirIfExists(BACKUP_WWW_DIR)
+        await safeRm(BACKUP_WWW_DIR)
       }
     } catch (er) {
-      logger.warn('performAtomicUpdateFromZip restore failed: ' + (er && er.message ? er.message : er))
+      logger.warn('performAtomicUpdateFromZip: restore attempt failed: ' + (er && er.message ? er.message : er))
     }
+    await Preferences.remove({ key: KEY_UPDATE_IN_PROGRESS })
     return false
   }
 }
 
-/**
- * checkForUpdates : récupère version.json, compare buildId (ou version fallback),
- * puis télécharge app.zip et appelle performAtomicUpdateFromZip.
- */
+/* ------------- Check for updates -------------- */
 export async function checkForUpdates(showPrompts = true) {
   try {
     logger.info('checkForUpdates: starting check...')
@@ -404,7 +516,7 @@ export async function checkForUpdates(showPrompts = true) {
       logger.warn('Impossible de récupérer version.json (status ' + r.status + ')')
       return
     }
-    const remote = await r.json() // { version, buildId, ... }
+    const remote = await r.json()
 
     const localVerPref = await Preferences.get({ key: KEY_VERSION })
     const localBuildPref = await Preferences.get({ key: KEY_BUILD_ID })
@@ -447,7 +559,7 @@ export async function checkForUpdates(showPrompts = true) {
       return
     }
 
-    // si tout OK : sauvegarder prefs
+    // save prefs
     await Preferences.set({ key: KEY_VERSION, value: remote.version })
     if (remote.buildId) {
       await Preferences.set({ key: KEY_BUILD_ID, value: String(remote.buildId) })
@@ -463,12 +575,8 @@ export async function checkForUpdates(showPrompts = true) {
             window.location.reload()
           }
         }
-      } catch (e) {
-        // ignore confirm errors
-      }
+      } catch (e) { /* ignore */ }
     } else {
-      // auto-inject already happened during performAtomicUpdateFromZip (we injected tmp for test),
-      // but after swap we may want to re-inject from real LOCAL_WWW_DIR to have correct baseUrl.
       await injectLocalIndexIntoContainer('localAppContainer', LOCAL_WWW_DIR)
     }
   } catch (err) {
