@@ -49,7 +49,7 @@ export default function App() {
       <h1>Grimm</h1>
 
       <div style={{ marginBottom: 12 }}>
-        <button onClick={handleCheck} style={{ padding: 8 }}>Vérifier MAJ (manuel)</button>
+        <button onClick={handleCheck} style={{ padding: 8 }}>Hey (manuel)</button>
         <button onClick={handleLoadLocal} style={{ marginLeft: 8, padding: 8 }}>Charger bundle local</button>
         <button onClick={handleReset} style={{ marginLeft: 8, padding: 8, background: '#d9534f', color: '#fff' }}>
           Reset bundle local
