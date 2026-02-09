@@ -197,35 +197,39 @@ export async function loadLocalIndexIfPresent() {
   }
 }
 
-export async function checkForUpdates(showPrompts = true) {
+export async function checkForUpdates(showPrompts = false) {
   try {
-    logger.info('checkForUpdates: starting')
+    logger.info('checkForUpdates: starting check...')
+    
+    // 1. Vérifier la version distante
     const r = await fetch(VERSION_URL + '?t=' + Date.now(), { cache: 'no-store' })
-    if (!r.ok) {
-      logger.warn('Impossible de récupérer version.json (status ' + r.status + ')')
-      return
-    }
+    if (!r.ok) return logger.warn('Check failed: version.json status ' + r.status)
+    
     const remote = await r.json()
     const local = await Preferences.get({ key: 'appVersion' })
     const localVersion = local?.value || '0.0.0'
-    logger.info(`Version locale=${localVersion} remote=${remote.version}`)
+
+    logger.info(`Version: Local=${localVersion} / Remote=${remote.version}`)
 
     if (localVersion === remote.version) {
-      logger.info('OTA: déjà à jour')
+      logger.info('App déjà à jour.')
       return
     }
 
-    logger.info('OTA: nouvelle version détectée: ' + remote.version)
+    // 2. Télécharger le ZIP
+    logger.info(`Téléchargement update ${remote.version}...`)
     const z = await fetch(BUNDLE_URL + '?t=' + Date.now())
-    if (!z.ok) {
-      logger.error('Erreur téléchargement bundle: ' + z.status)
-      return
-    }
+    if (!z.ok) return logger.error('Download failed: ' + z.status)
 
     const arrayBuffer = await z.arrayBuffer()
-    logger.info('Bundle téléchargé (' + arrayBuffer.byteLength + ' bytes). Extraction...')
     const zip = await JSZip.loadAsync(arrayBuffer)
 
+    // 3. IMPORTANT : Nettoyer l'ancienne version locale avant d'écrire la nouvelle
+    // On appelle ta fonction existante pour faire place nette
+    await clearLocalBundle() 
+    logger.info('Ancienne version supprimée. Installation de la nouvelle...')
+
+    // 4. Écrire les nouveaux fichiers
     const writePromises = []
     zip.forEach((relativePath, zipEntry) => {
       if (zipEntry.dir) return
@@ -233,31 +237,31 @@ export async function checkForUpdates(showPrompts = true) {
         const fullPath = `${LOCAL_WWW_DIR}/${relativePath}`
         const dir = fullPath.split('/').slice(0, -1).join('/')
         if (dir) await ensureDir(dir)
+        
+        // On utilise uint8array pour éviter les soucis de mémoire avec base64 sur gros fichiers si possible
+        // Mais gardons ta méthode base64 qui semble fonctionner pour toi :
         const base64 = await zipEntry.async('base64')
         await Filesystem.writeFile({
           path: fullPath,
           data: base64,
           directory: Directory.Data
         })
-        logger.info('Wrote ' + fullPath)
       })())
     })
 
     await Promise.all(writePromises)
+    
+    // 5. Mettre à jour le numéro de version
     await Preferences.set({ key: 'appVersion', value: remote.version })
-    logger.info('OTA: bundle applied locally (version=' + remote.version + ')')
+    logger.info(`Mise à jour ${remote.version} installée avec succès ! Elle sera active au prochain démarrage.`)
 
+    // Optionnel : Si on veut forcer le rechargement immédiat (attention ça peut couper l'utilisateur)
     if (showPrompts) {
-      if (confirm(`Nouvelle version (${remote.version}) téléchargée. Charger maintenant ?`)) {
-        const ok = await injectLocalIndexIntoContainer()
-        if (!ok) {
-          logger.warn('inject failed — fallback to navigation')
-          await loadLocalIndexIfPresent()
-        }
-      }
-    } else {
-      await injectLocalIndexIntoContainer()
+       if (confirm(`Mise à jour ${remote.version} installée. Redémarrer maintenant ?`)) {
+          window.location.reload()
+       }
     }
+
   } catch (err) {
     logger.error('checkForUpdates failed: ' + (err && err.message ? err.message : err))
   }
