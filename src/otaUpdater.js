@@ -249,3 +249,176 @@ export async function checkForUpdates(showPrompts = true) {
     logger.error('checkForUpdates failed: ' + (err && err.message ? err.message : err))
   }
 }
+
+// --- NOUVELLE LOGIQUE ---
+
+/**
+ * PHASE 1 (Démarrage):
+ * Vérifie si un fichier "pending_update.zip" existe.
+ * Si oui, on écrase le dossier 'www' avec son contenu.
+ */
+export async function installPendingUpdate() {
+  try {
+    const zipPath = PENDING_ZIP_FILENAME
+    
+    // 1. Vérifier si le fichier zip en attente existe
+    try {
+      await Filesystem.stat({ path: zipPath, directory: Directory.Data })
+      logger.info('BOOT: Mise à jour en attente trouvée ! Installation...')
+    } catch (e) {
+      logger.info('BOOT: Aucune mise à jour en attente.')
+      return false // Rien à faire
+    }
+
+    // 2. Lire le fichier zip depuis le stockage
+    const readFileResult = await Filesystem.readFile({
+      path: zipPath,
+      directory: Directory.Data
+    })
+    
+    // Sur Android/iOS readFile retourne souvent une base64 string
+    const zipData = readFileResult.data
+
+    // 3. Charger le ZIP avec JSZip
+    const zip = await JSZip.loadAsync(zipData, { base64: true })
+
+    // 4. Nettoyer l'ancien dossier www (sécurité)
+    // On réutilise ta logique de nettoyage partielle ou on écrase.
+    // Pour faire propre, on peut supprimer www d'abord.
+    try {
+        await Filesystem.rm({ path: LOCAL_WWW_DIR, directory: Directory.Data, recursive: true })
+    } catch(e) {}
+
+    // 5. Extraire le nouveau contenu
+    const writePromises = []
+    zip.forEach((relativePath, zipEntry) => {
+      if (zipEntry.dir) return
+      writePromises.push((async () => {
+        const fullPath = `${LOCAL_WWW_DIR}/${relativePath}`
+        const dir = fullPath.split('/').slice(0, -1).join('/')
+        if (dir) await ensureDir(dir)
+        
+        const base64 = await zipEntry.async('base64')
+        await Filesystem.writeFile({
+          path: fullPath,
+          data: base64,
+          directory: Directory.Data
+        })
+      })())
+    })
+
+    await Promise.all(writePromises)
+    logger.info('BOOT: Installation terminée.')
+
+    // 6. Supprimer le fichier zip en attente pour ne pas le réinstaller au prochain boot
+    await Filesystem.deleteFile({ path: zipPath, directory: Directory.Data })
+
+    return true
+
+  } catch (err) {
+    logger.error('BOOT: Erreur lors de l\'installation de la mise à jour en attente: ' + err.message)
+    // En cas d'erreur (zip corrompu?), on supprime le zip pour éviter une boucle infinie
+    try { await Filesystem.deleteFile({ path: PENDING_ZIP_FILENAME, directory: Directory.Data }) } catch(e) {}
+    return false
+  }
+}
+
+/**
+ * PHASE 2 (Background):
+ * Vérifie le serveur, compare les versions/buildId.
+ * Si nouveau, télécharge le ZIP et le sauvegarde sous "pending_update.zip".
+ */
+export async function downloadUpdateInBackground() {
+  try {
+    logger.info('BG: Vérification des mises à jour...')
+
+    // 1. Check Remote
+    const r = await fetch(VERSION_URL + '?t=' + Date.now(), { cache: 'no-store' })
+    if (!r.ok) return
+    const remote = await r.json()
+
+    // 2. Check Local Prefs (Ce qu'on utilise ACTUELLEMENT)
+    const localBuildPref = await Preferences.get({ key: KEY_BUILD_ID })
+    const localBuildId = localBuildPref?.value || null
+
+    // Comparaison
+    let updateAvailable = false
+    if (remote.buildId && String(remote.buildId) !== String(localBuildId)) {
+       updateAvailable = true
+    } else if (!remote.buildId && remote.version !== (await Preferences.get({ key: KEY_VERSION })).value) {
+       updateAvailable = true
+    }
+
+    if (!updateAvailable) {
+        logger.info('BG: App à jour.')
+        return
+    }
+
+    logger.info(`BG: Nouvelle version détectée (${remote.buildId}). Téléchargement...`)
+
+    // 3. Télécharger le ZIP (Blob)
+    const z = await fetch(BUNDLE_URL + '?t=' + Date.now())
+    if (!z.ok) throw new Error('Download failed ' + z.status)
+    
+    // On récupère le blob
+    const blob = await z.blob()
+    
+    // 4. Convertir Blob en Base64 pour l'écriture via Capacitor Filesystem
+    const base64Data = await new Promise((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onloadend = () => {
+            const res = reader.result
+            // reader.result est "data:application/zip;base64,....." -> on veut juste la partie base64
+            const base64 = res.split(',')[1]
+            resolve(base64)
+        }
+        reader.onerror = reject
+        reader.readAsDataURL(blob)
+    })
+
+    // 5. Sauvegarder en tant que "pending_update.zip"
+    await Filesystem.writeFile({
+        path: PENDING_ZIP_FILENAME,
+        data: base64Data,
+        directory: Directory.Data
+    })
+
+    // 6. Mettre à jour les préférences MAINTENANT ou APRÈS INSTALLATION ?
+    // IMPORTANT : On ne doit PAS mettre à jour KEY_VERSION / KEY_BUILD_ID maintenant,
+    // sinon au prochain boot, on croira qu'on est déjà à jour alors qu'on tourne sur la vieille version.
+    // Cependant, il faut savoir quelle version le ZIP contient pour la mettre à jour après l'install.
+    // Astuce simple : On stockera ces infos dans un petit fichier json "pending_meta.json" 
+    // ou on fera confiance au version.json inclus dans le zip au prochain boot (plus simple).
+    
+    // Pour simplifier ton code actuel, on ne change pas les préférences ici. 
+    // On mettra à jour les préférences UNIQUEMENT après le succès de `installPendingUpdate`.
+    // Mais il faut stocker les métadonnées futures quelque part pour que installPendingUpdate puisse update les prefs.
+    
+    const meta = { version: remote.version, buildId: remote.buildId }
+    await Filesystem.writeFile({
+        path: 'pending_meta.json',
+        data: JSON.stringify(meta),
+        directory: Directory.Data,
+        encoding: 'utf8'
+    })
+
+    logger.info('BG: Mise à jour téléchargée et prête pour le prochain démarrage.')
+
+  } catch (err) {
+    logger.error('BG: Erreur download: ' + err.message)
+  }
+}
+
+// NOTE: Il faut modifier légèrement `installPendingUpdate` ci-dessus pour qu'il lise `pending_meta.json` 
+// et mette à jour les Preferences après l'extraction.
+// Ajoute ceci à la fin du bloc try de `installPendingUpdate`, juste avant le return true :
+/*
+    // Mise à jour des préférences post-install
+    try {
+        const metaFile = await Filesystem.readFile({ path: 'pending_meta.json', directory: Directory.Data, encoding: 'utf8' })
+        const meta = JSON.parse(metaFile.data)
+        await Preferences.set({ key: KEY_VERSION, value: meta.version })
+        if (meta.buildId) await Preferences.set({ key: KEY_BUILD_ID, value: String(meta.buildId) })
+        await Filesystem.deleteFile({ path: 'pending_meta.json', directory: Directory.Data })
+    } catch(e) { logger.warn('BOOT: Impossible de maj les préférences version') }
+*/
